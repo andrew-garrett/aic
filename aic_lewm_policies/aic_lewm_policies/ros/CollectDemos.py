@@ -15,16 +15,16 @@ from __future__ import annotations
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-#  Recording follows ReferenceDataCollection (DataCollectionPolicyV3): after each
-#  pose command, sleep for the same dt as the motion policy, then read
-#  get_observation() and save only when the left camera stamp advances (avoids
-#  duplicate synchronized triples while the arm / sim catch up).
+#  Recording timing follows ReferenceDataCollection (DataCollectionPolicyV3):
+#  move_robot → sleep(step_dt) → sample Observation. Unlike v3's PNG logger, we do
+#  **not** deduplicate by camera stamp: proprio/state change every control step even
+#  when the synchronized camera triple is slower than the pose command rate; skipping
+#  those steps breaks (action, state, pixels) alignment for HDF5.
 #
 
 import importlib
 import inspect
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,16 +56,6 @@ from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
 
 
-@dataclass(frozen=True)
-class _SavedStamp:
-    sec: int
-    nanosec: int
-
-    @classmethod
-    def from_msg(cls, stamp) -> "_SavedStamp":
-        return cls(sec=int(stamp.sec), nanosec=int(stamp.nanosec))
-
-
 class CollectDemos(Policy):
     """Wrap an expert policy and record SWM-compatible HDF5 demonstrations."""
 
@@ -83,6 +73,10 @@ class CollectDemos(Policy):
         self._obs_wait_timeout_sec = float(
             os.environ.get("AIC_WAIT_OBS_TIMEOUT_SEC", "10.0")
         )
+        # After each sleep, brief poll if Observation is briefly None (executor catch-up).
+        self._post_step_obs_poll_sec = float(
+            os.environ.get("AIC_POST_STEP_OBS_POLL_SEC", "0.5")
+        )
         self._h5_path = self._stablewm_home / f"{self._dataset_name}.h5"
         self._stablewm_home.mkdir(parents=True, exist_ok=True)
 
@@ -91,7 +85,8 @@ class CollectDemos(Policy):
         self.get_logger().info(
             f"CollectDemos initialized. dataset={self._h5_path} delegate={self._delegate_policy} "
             f"capture_pixel_max={self._capture_pixel_max} "
-            f"obs_wait_timeout_sec={self._obs_wait_timeout_sec}"
+            f"obs_wait_timeout_sec={self._obs_wait_timeout_sec} "
+            f"post_step_obs_poll_sec={self._post_step_obs_poll_sec}"
         )
 
     def _load_delegate_policy(self, module_name: str) -> Policy:
@@ -162,28 +157,27 @@ class CollectDemos(Policy):
             ),
         )
 
-    def _maybe_record_after_command(
+    def _record_after_command(
         self,
         get_observation: GetObservationCallback,
         motion_update: MotionUpdate,
-        last_stamp: Optional[_SavedStamp],
-        last_ts: Optional[float],
-    ) -> tuple[Optional[_SavedStamp], Optional[float]]:
-        """ReferenceDataCollection-style: save once per new left-camera stamp."""
+        step_index: int,
+        phase: str,
+    ) -> None:
+        """Sample Observation after move+sleep; always append one transition if possible."""
         obs = get_observation()
         if obs is None:
-            return last_stamp, last_ts
-        stamp = _SavedStamp.from_msg(obs.left_image.header.stamp)
-        if last_stamp is not None and stamp == last_stamp:
-            return last_stamp, last_ts
-        ts_sec = float(obs.left_image.header.stamp.sec) + float(
-            obs.left_image.header.stamp.nanosec
-        ) * 1e-9
-        if last_ts is not None and ts_sec <= last_ts:
-            return last_stamp, last_ts
+            obs = self._wait_for_observation(
+                get_observation, self._post_step_obs_poll_sec
+            )
+        if obs is None:
+            self.get_logger().warn(
+                f"CollectDemos: no Observation after {phase} step {step_index} "
+                f"(poll {self._post_step_obs_poll_sec}s); skipping row."
+            )
+            return
         action = self._extract_action(motion_update, None)
         self._record_step(obs, action)
-        return stamp, ts_sec
 
     @staticmethod
     def _image_to_hwc(image_msg) -> np.ndarray:
@@ -451,9 +445,6 @@ class CollectDemos(Policy):
         z_offset = profile["approach_z_offset"]
         send_feedback("oracle aligning")
 
-        last_stamp: Optional[_SavedStamp] = None
-        last_ts: Optional[float] = None
-
         for t in range(profile["interp_steps"]):
             interp_fraction = t / float(profile["interp_steps"])
             try:
@@ -475,9 +466,7 @@ class CollectDemos(Policy):
             except Exception as ex:
                 self.get_logger().info(f"move_robot exception: {ex}")
             self.sleep_for(profile["step_sleep"])
-            last_stamp, last_ts = self._maybe_record_after_command(
-                get_observation, motion, last_stamp, last_ts
-            )
+            self._record_after_command(get_observation, motion, t, "approach")
 
         send_feedback("oracle descending")
         step_idx = 0
@@ -508,8 +497,8 @@ class CollectDemos(Policy):
             except Exception as ex:
                 self.get_logger().info(f"move_robot exception: {ex}")
             self.sleep_for(profile["step_sleep"])
-            last_stamp, last_ts = self._maybe_record_after_command(
-                get_observation, motion, last_stamp, last_ts
+            self._record_after_command(
+                get_observation, motion, step_idx, "insertion"
             )
 
         send_feedback("oracle settling")
