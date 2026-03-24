@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 #
 #  Copyright (C) 2026 Intrinsic Innovation LLC
 #
@@ -13,23 +15,37 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+#  Recording follows ReferenceDataCollection (DataCollectionPolicyV3): after each
+#  pose command, sleep for the same dt as the motion policy, then read
+#  get_observation() and save only when the left camera stamp advances (avoids
+#  duplicate synchronized triples while the arm / sim catch up).
+#
 
 import importlib
 import inspect
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import h5py
 import numpy as np
+from geometry_msgs.msg import Pose, Vector3, Wrench
 from rclpy.duration import Duration
+from rclpy.time import Time
+from std_msgs.msg import Header
+from tf2_ros import TransformException
 
 try:
     import cv2
 except ImportError:
     cv2 = None
 
-from aic_control_interfaces.msg import JointMotionUpdate, MotionUpdate
+from aic_control_interfaces.msg import (
+    JointMotionUpdate,
+    MotionUpdate,
+    TrajectoryGenerationMode,
+)
 from aic_model.policy import (
     GetObservationCallback,
     MoveRobotCallback,
@@ -38,6 +54,16 @@ from aic_model.policy import (
 )
 from aic_model_interfaces.msg import Observation
 from aic_task_interfaces.msg import Task
+
+
+@dataclass(frozen=True)
+class _SavedStamp:
+    sec: int
+    nanosec: int
+
+    @classmethod
+    def from_msg(cls, stamp) -> "_SavedStamp":
+        return cls(sec=int(stamp.sec), nanosec=int(stamp.nanosec))
 
 
 class CollectDemos(Policy):
@@ -53,11 +79,7 @@ class CollectDemos(Policy):
             "AIC_DEMO_DELEGATE_POLICY", "aic_lewm_policies.ros.OracleDualInsert"
         )
         self._max_steps = int(os.environ.get("AIC_DEMO_MAX_STEPS", "2000"))
-        # Downsample stored pixels for faster collection / smaller HDF5 (LeWM train resizes again).
-        # Max side in pixels; set <=0 to store full camera resolution.
         self._capture_pixel_max = int(os.environ.get("AIC_CAPTURE_PIXEL_MAX", "512"))
-        # aic_adapter only publishes Observation once left/center/right frames align.
-        # Poll until non-None or timeout (seconds).
         self._obs_wait_timeout_sec = float(
             os.environ.get("AIC_WAIT_OBS_TIMEOUT_SEC", "10.0")
         )
@@ -91,8 +113,6 @@ class CollectDemos(Policy):
         self._state = []
         self._rewards = []
         self._terminated = []
-        # Latest Observation from the delegate's get_observation() call (RunACT-style:
-        # sample obs, then move_robot). Cleared after each recorded move_robot.
         self._obs_last = None
 
     def _wait_for_observation(
@@ -100,24 +120,70 @@ class CollectDemos(Policy):
         get_observation: GetObservationCallback,
         timeout_sec: float,
     ) -> Optional[Observation]:
-        """Block until aic_model has a synchronized Observation (or timeout)."""
         start = self.time_now()
         limit = Duration(seconds=timeout_sec)
-        attempt = 0
         while (self.time_now() - start) < limit:
             obs = get_observation()
             if obs is not None:
                 return obs
-            if attempt % 20 == 0 and attempt > 0:
-                self.get_logger().info(
-                    "Still waiting for synchronized Observation (left/center/right)..."
-                )
-            attempt += 1
             self.sleep_for(0.05)
         self.get_logger().warn(
             f"No Observation received after {timeout_sec}s (check aic_adapter / camera topics)."
         )
         return None
+
+    def _make_pose_motion_update(
+        self,
+        pose: Pose,
+        frame_id: str = "base_link",
+        stiffness: Optional[list] = None,
+        damping: Optional[list] = None,
+    ) -> MotionUpdate:
+        """Same MotionUpdate construction as Policy.set_pose_target (for action logging)."""
+        if stiffness is None:
+            stiffness = [90.0, 90.0, 90.0, 50.0, 50.0, 50.0]
+        if damping is None:
+            damping = [50.0, 50.0, 50.0, 20.0, 20.0, 20.0]
+        return MotionUpdate(
+            header=Header(
+                frame_id=frame_id,
+                stamp=self._parent_node.get_clock().now().to_msg(),
+            ),
+            pose=pose,
+            target_stiffness=np.diag(stiffness).flatten(),
+            target_damping=np.diag(damping).flatten(),
+            feedforward_wrench_at_tip=Wrench(
+                force=Vector3(x=0.0, y=0.0, z=0.0),
+                torque=Vector3(x=0.0, y=0.0, z=0.0),
+            ),
+            wrench_feedback_gains_at_tip=[0.5, 0.5, 0.5, 0.0, 0.0, 0.0],
+            trajectory_generation_mode=TrajectoryGenerationMode(
+                mode=TrajectoryGenerationMode.MODE_POSITION,
+            ),
+        )
+
+    def _maybe_record_after_command(
+        self,
+        get_observation: GetObservationCallback,
+        motion_update: MotionUpdate,
+        last_stamp: Optional[_SavedStamp],
+        last_ts: Optional[float],
+    ) -> tuple[Optional[_SavedStamp], Optional[float]]:
+        """ReferenceDataCollection-style: save once per new left-camera stamp."""
+        obs = get_observation()
+        if obs is None:
+            return last_stamp, last_ts
+        stamp = _SavedStamp.from_msg(obs.left_image.header.stamp)
+        if last_stamp is not None and stamp == last_stamp:
+            return last_stamp, last_ts
+        ts_sec = float(obs.left_image.header.stamp.sec) + float(
+            obs.left_image.header.stamp.nanosec
+        ) * 1e-9
+        if last_ts is not None and ts_sec <= last_ts:
+            return last_stamp, last_ts
+        action = self._extract_action(motion_update, None)
+        self._record_step(obs, action)
+        return stamp, ts_sec
 
     @staticmethod
     def _image_to_hwc(image_msg) -> np.ndarray:
@@ -129,14 +195,9 @@ class CollectDemos(Policy):
                 f"Image size mismatch: got {len(buf)} bytes for {h}x{w}x3 (expected {need}); "
                 f"encoding={getattr(image_msg, 'encoding', '')!r}"
             )
-        # Copy: np.frombuffer is a view; ROS messages may reuse buffers. Lists of views
-        # can all end up showing the last frame if the underlying storage is overwritten.
-        return (
-            np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
-        )
+        return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
 
     def _resize_for_storage(self, img_hwc: np.ndarray) -> np.ndarray:
-        """Resize so max(height, width) <= _capture_pixel_max; preserve aspect ratio."""
         max_side = self._capture_pixel_max
         if max_side <= 0:
             return img_hwc
@@ -148,10 +209,7 @@ class CollectDemos(Policy):
         new_w = max(1, int(round(w * scale)))
         new_h = max(1, int(round(h * scale)))
         if cv2 is not None:
-            return cv2.resize(
-                img_hwc, (new_w, new_h), interpolation=cv2.INTER_AREA
-            )
-        # Fallback without OpenCV (LANCZOS on uint8)
+            return cv2.resize(img_hwc, (new_w, new_h), interpolation=cv2.INTER_AREA)
         try:
             from PIL import Image
 
@@ -222,8 +280,6 @@ class CollectDemos(Policy):
         motion_update: MotionUpdate = None,
         joint_motion_update: JointMotionUpdate = None,
     ) -> np.ndarray:
-        # Fixed 14-dim action representation:
-        # [mode, 7 pose-or-joint slots, 6 twist-or-joint-velocity slots]
         action = np.zeros((14,), dtype=np.float32)
         if motion_update is not None:
             action[0] = 1.0
@@ -312,12 +368,6 @@ class CollectDemos(Policy):
         terminated = np.asarray(self._terminated, dtype=np.bool_)
 
         with h5py.File(self._h5_path, "a") as h5_file:
-            # Dense per-step metadata (same convention as official Push-T HDF5 releases):
-            # - episode_idx: which episode this row belongs to (0 .. num_episodes-1)
-            # - step_idx: index within that episode (0 .. ep_len-1)
-            # Redundant with ep_len/ep_offset but useful for swm inspect / filtering.
-            # stable_worldmodel.HDF5Dataset only *requires* ep_len + ep_offset; keep these
-            # out of LeWM keys_to_load so they are not fed to the model.
             next_ep_idx = (
                 int(h5_file["ep_len"].shape[0]) if "ep_len" in h5_file else 0
             )
@@ -365,18 +415,116 @@ class CollectDemos(Policy):
             f"Recorded episode len={episode_len} to {self._h5_path.name}"
         )
 
-    def insert_cable(
+    def _insert_cable_oracle_dual_insert(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+        oracle: Any,
+    ) -> bool:
+        """Oracle motion (same as OracleDualInsert.insert_cable) + v3-style HDF5 timing."""
+        oracle._task = task
+        profile = oracle._get_task_profile(task)
+        self.get_logger().info(
+            f"CollectDemos oracle loop task={task.id} profile={profile['name']}"
+        )
+
+        port_frame = f"task_board/{task.target_module_name}/{task.port_name}_link"
+        cable_tip_frame = f"{task.cable_name}/{task.plug_name}_link"
+
+        for frame in [port_frame, cable_tip_frame]:
+            if not oracle._wait_for_tf("base_link", frame):
+                return False
+
+        try:
+            port_tf_stamped = self._parent_node._tf_buffer.lookup_transform(
+                "base_link",
+                port_frame,
+                Time(),
+            )
+        except TransformException as ex:
+            self.get_logger().error(f"Could not look up port transform: {ex}")
+            return False
+
+        port_transform = port_tf_stamped.transform
+        z_offset = profile["approach_z_offset"]
+        send_feedback("oracle aligning")
+
+        last_stamp: Optional[_SavedStamp] = None
+        last_ts: Optional[float] = None
+
+        for t in range(profile["interp_steps"]):
+            interp_fraction = t / float(profile["interp_steps"])
+            try:
+                pose = oracle.calc_gripper_pose(
+                    port_transform,
+                    slerp_fraction=interp_fraction,
+                    position_fraction=interp_fraction,
+                    z_offset=z_offset,
+                    reset_xy_integrator=True,
+                )
+            except TransformException as ex:
+                self.get_logger().warn(f"TF lookup failed during interpolation: {ex}")
+                self.sleep_for(profile["step_sleep"])
+                continue
+
+            motion = self._make_pose_motion_update(pose)
+            try:
+                move_robot(motion_update=motion)
+            except Exception as ex:
+                self.get_logger().info(f"move_robot exception: {ex}")
+            self.sleep_for(profile["step_sleep"])
+            last_stamp, last_ts = self._maybe_record_after_command(
+                get_observation, motion, last_stamp, last_ts
+            )
+
+        send_feedback("oracle descending")
+        step_idx = 0
+        while z_offset > profile["min_z_offset"]:
+            z_offset -= profile["descend_step"]
+            dither_amp = profile["xy_dither_amp"]
+            dither_period = profile["xy_dither_period_steps"]
+            phase = 2.0 * np.pi * (step_idx % dither_period) / float(dither_period)
+            xy_dither = (
+                dither_amp * np.cos(phase),
+                dither_amp * np.sin(phase),
+            )
+            step_idx += 1
+            try:
+                pose = oracle.calc_gripper_pose(
+                    port_transform,
+                    z_offset=z_offset,
+                    xy_dither=xy_dither,
+                )
+            except TransformException as ex:
+                self.get_logger().warn(f"TF lookup failed during insertion: {ex}")
+                self.sleep_for(profile["step_sleep"])
+                continue
+
+            motion = self._make_pose_motion_update(pose)
+            try:
+                move_robot(motion_update=motion)
+            except Exception as ex:
+                self.get_logger().info(f"move_robot exception: {ex}")
+            self.sleep_for(profile["step_sleep"])
+            last_stamp, last_ts = self._maybe_record_after_command(
+                get_observation, motion, last_stamp, last_ts
+            )
+
+        send_feedback("oracle settling")
+        self.sleep_for(profile["settle_sec"])
+        self.get_logger().info("CollectDemos oracle loop done")
+        return True
+
+    def _insert_cable_delegate_wrapped(
         self,
         task: Task,
         get_observation: GetObservationCallback,
         move_robot: MoveRobotCallback,
         send_feedback: SendFeedbackCallback,
     ) -> bool:
-        self._reset_episode_buffers()
-        self.get_logger().info(
-            f"CollectDemos.insert_cable() start. task={task.id} dataset={self._dataset_name}"
-        )
-
+        """Non-oracle delegates (e.g. RunACT): pair obs from get_observation with move_robot."""
         def wrapped_get_observation():
             obs = self._wait_for_observation(
                 get_observation, self._obs_wait_timeout_sec
@@ -385,9 +533,6 @@ class CollectDemos(Policy):
             return obs
 
         def wrapped_move_robot(motion_update=None, joint_motion_update=None):
-            # Pair (observation, action) like RunACT: delegate should call
-            # get_observation() before each move_robot / set_pose_target. We record
-            # using that snapshot; if none, wait for a synchronized Observation.
             obs = self._obs_last
             if obs is None:
                 obs = self._wait_for_observation(
@@ -401,19 +546,51 @@ class CollectDemos(Policy):
                 motion_update=motion_update, joint_motion_update=joint_motion_update
             )
 
+        return bool(
+            self._delegate.insert_cable(
+                task=task,
+                get_observation=wrapped_get_observation,
+                move_robot=wrapped_move_robot,
+                send_feedback=send_feedback,
+            )
+        )
+
+    def insert_cable(
+        self,
+        task: Task,
+        get_observation: GetObservationCallback,
+        move_robot: MoveRobotCallback,
+        send_feedback: SendFeedbackCallback,
+    ) -> bool:
+        self._reset_episode_buffers()
+        self.get_logger().info(
+            f"CollectDemos.insert_cable() start. task={task.id} dataset={self._dataset_name}"
+        )
+
+        obs0 = self._wait_for_observation(get_observation, self._obs_wait_timeout_sec)
+        if obs0 is None:
+            self.get_logger().error("CollectDemos: no initial Observation; abort.")
+            self._flush_episode()
+            return False
+
         success = False
         send_feedback("collecting demonstration")
         try:
-            success = bool(
-                self._delegate.insert_cable(
-                    task=task,
-                    get_observation=wrapped_get_observation,
-                    move_robot=wrapped_move_robot,
-                    send_feedback=send_feedback,
+            delegate_name = self._delegate.__class__.__name__
+            if delegate_name == "OracleDualInsert":
+                success = self._insert_cable_oracle_dual_insert(
+                    task, get_observation, move_robot, send_feedback, self._delegate
                 )
-            )
+            else:
+                self.get_logger().info(
+                    f"CollectDemos: delegate {delegate_name} uses wrapped insert_cable "
+                    "(not the inline oracle loop)."
+                )
+                success = self._insert_cable_delegate_wrapped(
+                    task, get_observation, move_robot, send_feedback
+                )
         except Exception as ex:
-            self.get_logger().error(f"Delegate policy failed: {ex}")
+            self.get_logger().error(f"CollectDemos failed: {ex}")
             success = False
 
         self._flush_episode()
