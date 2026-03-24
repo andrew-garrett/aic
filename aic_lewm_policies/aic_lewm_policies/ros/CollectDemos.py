@@ -22,6 +22,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from aic_control_interfaces.msg import JointMotionUpdate, MotionUpdate
 from aic_model.policy import (
     GetObservationCallback,
@@ -46,13 +51,17 @@ class CollectDemos(Policy):
             "AIC_DEMO_DELEGATE_POLICY", "aic_lewm_policies.ros.OracleDualInsert"
         )
         self._max_steps = int(os.environ.get("AIC_DEMO_MAX_STEPS", "2000"))
+        # Downsample stored pixels for faster collection / smaller HDF5 (LeWM train resizes again).
+        # Max side in pixels; set <=0 to store full camera resolution.
+        self._capture_pixel_max = int(os.environ.get("AIC_CAPTURE_PIXEL_MAX", "512"))
         self._h5_path = self._stablewm_home / f"{self._dataset_name}.h5"
         self._stablewm_home.mkdir(parents=True, exist_ok=True)
 
         self._delegate = self._load_delegate_policy(self._delegate_policy)
         self._reset_episode_buffers()
         self.get_logger().info(
-            f"CollectDemos initialized. dataset={self._h5_path} delegate={self._delegate_policy}"
+            f"CollectDemos initialized. dataset={self._h5_path} delegate={self._delegate_policy} "
+            f"capture_pixel_max={self._capture_pixel_max}"
         )
 
     def _load_delegate_policy(self, module_name: str) -> Policy:
@@ -80,6 +89,39 @@ class CollectDemos(Policy):
             image_msg.height, image_msg.width, 3
         )
         return img
+
+    def _resize_for_storage(self, img_hwc: np.ndarray) -> np.ndarray:
+        """Resize so max(height, width) <= _capture_pixel_max; preserve aspect ratio."""
+        max_side = self._capture_pixel_max
+        if max_side <= 0:
+            return img_hwc
+        h, w = img_hwc.shape[:2]
+        m = max(h, w)
+        if m <= max_side:
+            return img_hwc
+        scale = max_side / float(m)
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        if cv2 is not None:
+            return cv2.resize(
+                img_hwc, (new_w, new_h), interpolation=cv2.INTER_AREA
+            )
+        # Fallback without OpenCV (LANCZOS on uint8)
+        try:
+            from PIL import Image
+
+            pil = Image.fromarray(img_hwc)
+            pil = pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            return np.asarray(pil)
+        except ImportError as ex:
+            raise RuntimeError(
+                "CollectDemos needs opencv-python or Pillow to resize images; "
+                "install one of them, or set AIC_CAPTURE_PIXEL_MAX=0 for full resolution."
+            ) from ex
+
+    def _center_image_for_dataset(self, obs: Observation) -> np.ndarray:
+        raw = self._image_to_hwc(obs.center_image)
+        return self._resize_for_storage(raw)
 
     @staticmethod
     def _safe_list(values, count):
@@ -166,7 +208,7 @@ class CollectDemos(Policy):
     def _record_step(self, obs: Observation, action: np.ndarray):
         if len(self._actions) >= self._max_steps:
             return
-        self._pixels.append(self._image_to_hwc(obs.center_image))
+        self._pixels.append(self._center_image_for_dataset(obs))
         self._actions.append(action)
         self._proprio.append(self._extract_proprio(obs))
         self._state.append(self._extract_state(obs))
@@ -207,12 +249,26 @@ class CollectDemos(Policy):
         terminated = np.asarray(self._terminated, dtype=np.bool_)
 
         with h5py.File(self._h5_path, "a") as h5_file:
+            # Dense per-step metadata (same convention as official Push-T HDF5 releases):
+            # - episode_idx: which episode this row belongs to (0 .. num_episodes-1)
+            # - step_idx: index within that episode (0 .. ep_len-1)
+            # Redundant with ep_len/ep_offset but useful for swm inspect / filtering.
+            # stable_worldmodel.HDF5Dataset only *requires* ep_len + ep_offset; keep these
+            # out of LeWM keys_to_load so they are not fed to the model.
+            next_ep_idx = (
+                int(h5_file["ep_len"].shape[0]) if "ep_len" in h5_file else 0
+            )
+            episode_idx = np.full(episode_len, next_ep_idx, dtype=np.int64)
+            step_idx = np.arange(episode_len, dtype=np.int64)
+
             self._append_dataset(h5_file, "pixels", pixels)
             self._append_dataset(h5_file, "action", actions)
             self._append_dataset(h5_file, "proprio", proprio)
             self._append_dataset(h5_file, "state", state)
             self._append_dataset(h5_file, "reward", rewards)
             self._append_dataset(h5_file, "terminated", terminated)
+            self._append_dataset(h5_file, "episode_idx", episode_idx)
+            self._append_dataset(h5_file, "step_idx", step_idx)
 
             if "ep_len" not in h5_file:
                 h5_file.create_dataset(
