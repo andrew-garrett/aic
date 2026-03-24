@@ -22,6 +22,7 @@ POLICY_CLASS="aic_lewm_policies.ros.CollectDemos"
 POLICY_DELAY_SEC=10
 GROUND_TRUTH="true"
 BATCH_SIZE=5
+LOG_ROOT=""
 
 usage() {
   cat <<EOF
@@ -36,6 +37,7 @@ Options:
   --policy-delay-sec N    Delay before policy starts (default: ${POLICY_DELAY_SEC})
   --ground-truth BOOL     true/false for sim ground truth TF (default: ${GROUND_TRUTH})
   --batch-size N          Split trials into YAML batches of N; when num-trials > N, each batch gets a new tmux pair (default: ${BATCH_SIZE})
+  --log-root DIR          Parent dir for per-session logs (default: /tmp/aic_collect_logs_<timestamp>)
   --no-attach             Do not tmux attach (wait for each sim to exit; cleans up sessions)
   -h, --help              Show this help
 EOF
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --policy-delay-sec) POLICY_DELAY_SEC="$2"; shift 2 ;;
     --ground-truth) GROUND_TRUTH="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+    --log-root) LOG_ROOT="$2"; shift 2 ;;
     --no-attach) ATTACH_LAST=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1"; usage; exit 1 ;;
@@ -82,6 +85,10 @@ RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 RANDOM_CFG="/tmp/aic_random_engine_${SEED}_${RUN_STAMP}.yaml"
 SAMPLE_CFG="${AIC_ROOT}/aic_engine/config/sample_config.yaml"
 BATCH_DIR="/tmp/aic_engine_batches_${SEED}_${RUN_STAMP}"
+if [[ -z "${LOG_ROOT}" ]]; then
+  LOG_ROOT="/tmp/aic_collect_logs_${RUN_STAMP}"
+fi
+mkdir -p "${LOG_ROOT}"
 
 python3 "${SCRIPT_DIR}/generate_random_engine_config.py" \
   --sample-config "${SAMPLE_CFG}" \
@@ -113,6 +120,7 @@ pixi run ros2 run aic_model aic_model --ros-args -p use_sim_time:=true -p policy
 
 wait_sim_then_cleanup() {
   local session="$1"
+  local log_dir="$2"
   # Window 0 = sim: wait until its pane exits (aic_engine / entrypoint finished).
   while tmux has-session -t "${session}" 2>/dev/null; do
     local dead
@@ -122,13 +130,51 @@ wait_sim_then_cleanup() {
     fi
     sleep 2
   done
+  capture_session_logs "${session}" "${log_dir}"
   tmux kill-session -t "${session}" 2>/dev/null || true
+}
+
+start_session_logging() {
+  local session="$1"
+  local log_dir="$2"
+  local cfg="$3"
+  local sim_cmd="$4"
+  local policy_cmd="$5"
+
+  mkdir -p "${log_dir}"
+  cp "${cfg}" "${log_dir}/engine_config.yaml"
+  cat > "${log_dir}/meta.txt" <<EOF
+run_stamp=${RUN_STAMP}
+session=${session}
+batch_config=${cfg}
+dataset=${DATASET_NAME}
+seed=${SEED}
+task_mode=${TASK_MODE}
+ground_truth=${GROUND_TRUTH}
+policy_class=${POLICY_CLASS}
+policy_delay_sec=${POLICY_DELAY_SEC}
+EOF
+  printf '%s\n' "${sim_cmd}" > "${log_dir}/sim_command.txt"
+  printf '%s\n' "${policy_cmd}" > "${log_dir}/policy_command.txt"
+
+  # Stream full pane output to files in real time.
+  tmux pipe-pane -o -t "${session}:0" "cat >> \"${log_dir}/sim.log\""
+  tmux pipe-pane -o -t "${session}:1" "cat >> \"${log_dir}/policy.log\""
+}
+
+capture_session_logs() {
+  local session="$1"
+  local log_dir="$2"
+  # Final pane snapshots (useful if a process exited before pipe flush or for quick tail review).
+  tmux capture-pane -p -S - -t "${session}:0" > "${log_dir}/sim_capture.txt" 2>/dev/null || true
+  tmux capture-pane -p -S - -t "${session}:1" > "${log_dir}/policy_capture.txt" 2>/dev/null || true
 }
 
 BATCH_NUM=0
 for CFG in "${BATCH_FILES[@]}"; do
   BATCH_NUM=$((BATCH_NUM + 1))
   SESSION_BATCH="${SESSION_NAME}_b${BATCH_NUM}_${RUN_STAMP}"
+  BATCH_LOG_DIR="${LOG_ROOT}/batch_${BATCH_NUM}"
 
   if tmux has-session -t "${SESSION_BATCH}" 2>/dev/null; then
     echo "tmux session '${SESSION_BATCH}' already exists."
@@ -149,6 +195,8 @@ aic_engine_config_file:=${CFG}"
 
   tmux new-session -d -s "${SESSION_BATCH}" -n sim "${SIM_CMD}"
   tmux new-window -t "${SESSION_BATCH}:1" -n policy "${POLICY_CMD}"
+  start_session_logging "${SESSION_BATCH}" "${BATCH_LOG_DIR}" "${CFG}" "${SIM_CMD}" "${POLICY_CMD}"
+  echo "  Logs: ${BATCH_LOG_DIR}/"
 
   if [[ "${TOTAL_BATCHES}" -gt 1 ]]; then
     echo "  Optional: tmux attach -t ${SESSION_BATCH}"
@@ -159,9 +207,10 @@ aic_engine_config_file:=${CFG}"
     echo "  Full config: ${RANDOM_CFG}"
     if [[ "${ATTACH_LAST}" -eq 1 ]]; then
       tmux attach -t "${SESSION_BATCH}"
+      capture_session_logs "${SESSION_BATCH}" "${BATCH_LOG_DIR}"
     else
       echo "  Waiting for sim to exit..."
-      wait_sim_then_cleanup "${SESSION_BATCH}"
+      wait_sim_then_cleanup "${SESSION_BATCH}" "${BATCH_LOG_DIR}"
     fi
     echo "Done."
     exit 0
@@ -170,16 +219,17 @@ aic_engine_config_file:=${CFG}"
   # Multiple batches: wait/kill until the last; then attach or wait that one.
   if [[ "${BATCH_NUM}" -lt "${TOTAL_BATCHES}" ]]; then
     echo "  Waiting for batch ${BATCH_NUM} sim to finish..."
-    wait_sim_then_cleanup "${SESSION_BATCH}"
+    wait_sim_then_cleanup "${SESSION_BATCH}" "${BATCH_LOG_DIR}"
     echo "  Batch ${BATCH_NUM} finished; pausing before next batch..."
     sleep 2
   else
     if [[ "${ATTACH_LAST}" -eq 1 ]]; then
       echo "  Attaching to final batch (detach with Ctrl-b d)..."
       tmux attach -t "${SESSION_BATCH}"
+      capture_session_logs "${SESSION_BATCH}" "${BATCH_LOG_DIR}"
     else
       echo "  Waiting for final batch sim to finish..."
-      wait_sim_then_cleanup "${SESSION_BATCH}"
+      wait_sim_then_cleanup "${SESSION_BATCH}" "${BATCH_LOG_DIR}"
     fi
   fi
 done
@@ -188,3 +238,4 @@ echo
 echo "All batches complete."
 echo "  Full trial list: ${RANDOM_CFG}"
 echo "  Batch configs:    ${BATCH_DIR}/"
+echo "  Logs:             ${LOG_ROOT}/"
