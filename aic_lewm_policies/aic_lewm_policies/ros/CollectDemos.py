@@ -83,14 +83,22 @@ class CollectDemos(Policy):
         self._state = []
         self._rewards = []
         self._terminated = []
-        self._latest_observation = None
 
     @staticmethod
     def _image_to_hwc(image_msg) -> np.ndarray:
-        img = np.frombuffer(image_msg.data, dtype=np.uint8).reshape(
-            image_msg.height, image_msg.width, 3
+        h, w = int(image_msg.height), int(image_msg.width)
+        need = h * w * 3
+        buf = image_msg.data
+        if len(buf) != need:
+            raise ValueError(
+                f"Image size mismatch: got {len(buf)} bytes for {h}x{w}x3 (expected {need}); "
+                f"encoding={getattr(image_msg, 'encoding', '')!r}"
+            )
+        # Copy: np.frombuffer is a view; ROS messages may reuse buffers. Lists of views
+        # can all end up showing the last frame if the underlying storage is overwritten.
+        return (
+            np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3).copy()
         )
-        return img
 
     def _resize_for_storage(self, img_hwc: np.ndarray) -> np.ndarray:
         """Resize so max(height, width) <= _capture_pixel_max; preserve aspect ratio."""
@@ -335,15 +343,12 @@ class CollectDemos(Policy):
         )
 
         def wrapped_get_observation():
-            obs = get_observation()
-            if obs is not None:
-                self._latest_observation = obs
-            return obs
+            return get_observation()
 
         def wrapped_move_robot(motion_update=None, joint_motion_update=None):
-            obs = self._latest_observation
-            if obs is None:
-                obs = wrapped_get_observation()
+            # Delegates like OracleDualInsert often never call get_observation() between
+            # move_robot steps; always pull the latest Observation from aic_model here.
+            obs = wrapped_get_observation()
             if obs is not None:
                 action = self._extract_action(motion_update, joint_motion_update)
                 self._record_step(obs, action)
