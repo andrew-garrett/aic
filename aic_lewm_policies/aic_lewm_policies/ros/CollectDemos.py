@@ -18,9 +18,11 @@ import importlib
 import inspect
 import os
 from pathlib import Path
+from typing import Optional
 
 import h5py
 import numpy as np
+from rclpy.duration import Duration
 
 try:
     import cv2
@@ -54,6 +56,11 @@ class CollectDemos(Policy):
         # Downsample stored pixels for faster collection / smaller HDF5 (LeWM train resizes again).
         # Max side in pixels; set <=0 to store full camera resolution.
         self._capture_pixel_max = int(os.environ.get("AIC_CAPTURE_PIXEL_MAX", "512"))
+        # aic_adapter only publishes Observation once left/center/right frames align.
+        # Poll until non-None or timeout (seconds).
+        self._obs_wait_timeout_sec = float(
+            os.environ.get("AIC_WAIT_OBS_TIMEOUT_SEC", "10.0")
+        )
         self._h5_path = self._stablewm_home / f"{self._dataset_name}.h5"
         self._stablewm_home.mkdir(parents=True, exist_ok=True)
 
@@ -61,7 +68,8 @@ class CollectDemos(Policy):
         self._reset_episode_buffers()
         self.get_logger().info(
             f"CollectDemos initialized. dataset={self._h5_path} delegate={self._delegate_policy} "
-            f"capture_pixel_max={self._capture_pixel_max}"
+            f"capture_pixel_max={self._capture_pixel_max} "
+            f"obs_wait_timeout_sec={self._obs_wait_timeout_sec}"
         )
 
     def _load_delegate_policy(self, module_name: str) -> Policy:
@@ -86,6 +94,30 @@ class CollectDemos(Policy):
         # Latest Observation from the delegate's get_observation() call (RunACT-style:
         # sample obs, then move_robot). Cleared after each recorded move_robot.
         self._obs_last = None
+
+    def _wait_for_observation(
+        self,
+        get_observation: GetObservationCallback,
+        timeout_sec: float,
+    ) -> Optional[Observation]:
+        """Block until aic_model has a synchronized Observation (or timeout)."""
+        start = self.time_now()
+        limit = Duration(seconds=timeout_sec)
+        attempt = 0
+        while (self.time_now() - start) < limit:
+            obs = get_observation()
+            if obs is not None:
+                return obs
+            if attempt % 20 == 0 and attempt > 0:
+                self.get_logger().info(
+                    "Still waiting for synchronized Observation (left/center/right)..."
+                )
+            attempt += 1
+            self.sleep_for(0.05)
+        self.get_logger().warn(
+            f"No Observation received after {timeout_sec}s (check aic_adapter / camera topics)."
+        )
+        return None
 
     @staticmethod
     def _image_to_hwc(image_msg) -> np.ndarray:
@@ -346,17 +378,21 @@ class CollectDemos(Policy):
         )
 
         def wrapped_get_observation():
-            obs = get_observation()
+            obs = self._wait_for_observation(
+                get_observation, self._obs_wait_timeout_sec
+            )
             self._obs_last = obs
             return obs
 
         def wrapped_move_robot(motion_update=None, joint_motion_update=None):
             # Pair (observation, action) like RunACT: delegate should call
             # get_observation() before each move_robot / set_pose_target. We record
-            # using that snapshot; if none, fall back to a fresh poll.
+            # using that snapshot; if none, wait for a synchronized Observation.
             obs = self._obs_last
             if obs is None:
-                obs = wrapped_get_observation()
+                obs = self._wait_for_observation(
+                    get_observation, self._obs_wait_timeout_sec
+                )
             if obs is not None:
                 action = self._extract_action(motion_update, joint_motion_update)
                 self._record_step(obs, action)
