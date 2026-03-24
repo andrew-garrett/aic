@@ -17,7 +17,7 @@ TASK_MODE="mixed"        # mixed | sfp_only | sc_only
 SESSION_NAME="aic_collect"
 DATASET_NAME="aic_cable_train_r512"
 POLICY_CLASS="aic_lewm_policies.ros.CollectDemos"
-POLICY_DELAY_SEC=15
+POLICY_DELAY_SEC=10
 GROUND_TRUTH="true"
 
 usage() {
@@ -74,6 +74,8 @@ SIM_CMD="distrobox enter -r aic_eval -- /entrypoint.sh \
 ground_truth:=${GROUND_TRUTH} \
 start_aic_engine:=true \
 shutdown_on_aic_engine_exit:=true \
+launch_rviz:=false \
+gazebo_gui:=false \
 aic_engine_config_file:=${RANDOM_CFG}"
 
 POLICY_CMD="cd '${AIC_ROOT}' && \
