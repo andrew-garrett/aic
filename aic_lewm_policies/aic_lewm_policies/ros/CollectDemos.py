@@ -83,6 +83,9 @@ class CollectDemos(Policy):
         self._state = []
         self._rewards = []
         self._terminated = []
+        # Latest Observation from the delegate's get_observation() call (RunACT-style:
+        # sample obs, then move_robot). Cleared after each recorded move_robot.
+        self._obs_last = None
 
     @staticmethod
     def _image_to_hwc(image_msg) -> np.ndarray:
@@ -343,15 +346,21 @@ class CollectDemos(Policy):
         )
 
         def wrapped_get_observation():
-            return get_observation()
+            obs = get_observation()
+            self._obs_last = obs
+            return obs
 
         def wrapped_move_robot(motion_update=None, joint_motion_update=None):
-            # Delegates like OracleDualInsert often never call get_observation() between
-            # move_robot steps; always pull the latest Observation from aic_model here.
-            obs = wrapped_get_observation()
+            # Pair (observation, action) like RunACT: delegate should call
+            # get_observation() before each move_robot / set_pose_target. We record
+            # using that snapshot; if none, fall back to a fresh poll.
+            obs = self._obs_last
+            if obs is None:
+                obs = wrapped_get_observation()
             if obs is not None:
                 action = self._extract_action(motion_update, joint_motion_update)
                 self._record_step(obs, action)
+            self._obs_last = None
             return move_robot(
                 motion_update=motion_update, joint_motion_update=joint_motion_update
             )

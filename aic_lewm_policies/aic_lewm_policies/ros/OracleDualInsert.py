@@ -233,6 +233,8 @@ class OracleDualInsert(Policy):
 
         for t in range(profile["interp_steps"]):
             interp_fraction = t / float(profile["interp_steps"])
+            # Match RunACT: pull a fresh observation before each control command.
+            get_observation()
             try:
                 self.set_pose_target(
                     move_robot=move_robot,
@@ -260,6 +262,7 @@ class OracleDualInsert(Policy):
                 dither_amp * np.sin(phase),
             )
             step_idx += 1
+            get_observation()
             try:
                 self.set_pose_target(
                     move_robot=move_robot,
