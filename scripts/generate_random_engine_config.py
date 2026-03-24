@@ -59,7 +59,6 @@ def _trial_template() -> dict:
 
 def _build_trial(
     rng: random.Random,
-    trial_idx: int,
     task_type: str,
     board_x_range: tuple[float, float],
     board_y_range: tuple[float, float],
@@ -116,7 +115,10 @@ def _build_trial(
     }
 
     if task_type == "sfp":
-        cable_name = f"cable_{trial_idx}"
+        # Keep cable identities aligned with sample_config semantics:
+        # - SFP insertion uses cable_0
+        # - SC insertion uses cable_1
+        cable_name = "cable_0"
         trial["scene"]["cables"][cable_name] = {
             "pose": {
                 "gripper_offset": {"x": 0.0, "y": 0.015385, "z": 0.04245},
@@ -138,7 +140,7 @@ def _build_trial(
             "time_limit": 180,
         }
     else:
-        cable_name = f"cable_{trial_idx}"
+        cable_name = "cable_1"
         trial["scene"]["cables"][cable_name] = {
             "pose": {
                 "gripper_offset": {"x": 0.0, "y": 0.015385, "z": 0.04045},
@@ -210,7 +212,6 @@ def main() -> None:
 
         out["trials"][f"trial_{i}"] = _build_trial(
             rng=rng,
-            trial_idx=i - 1,
             task_type=task_type,
             board_x_range=(args.board_x_min, args.board_x_max),
             board_y_range=(args.board_y_min, args.board_y_max),
