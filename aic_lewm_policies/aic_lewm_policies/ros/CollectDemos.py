@@ -76,6 +76,8 @@ class CollectDemos(Policy):
 
     def _reset_episode_buffers(self):
         self._pixels = []
+        self._pixels_left = []
+        self._pixels_right = []
         self._actions = []
         self._proprio = []
         self._state = []
@@ -121,6 +123,14 @@ class CollectDemos(Policy):
 
     def _center_image_for_dataset(self, obs: Observation) -> np.ndarray:
         raw = self._image_to_hwc(obs.center_image)
+        return self._resize_for_storage(raw)
+
+    def _left_image_for_dataset(self, obs: Observation) -> np.ndarray:
+        raw = self._image_to_hwc(obs.left_image)
+        return self._resize_for_storage(raw)
+
+    def _right_image_for_dataset(self, obs: Observation) -> np.ndarray:
+        raw = self._image_to_hwc(obs.right_image)
         return self._resize_for_storage(raw)
 
     @staticmethod
@@ -209,6 +219,8 @@ class CollectDemos(Policy):
         if len(self._actions) >= self._max_steps:
             return
         self._pixels.append(self._center_image_for_dataset(obs))
+        self._pixels_left.append(self._left_image_for_dataset(obs))
+        self._pixels_right.append(self._right_image_for_dataset(obs))
         self._actions.append(action)
         self._proprio.append(self._extract_proprio(obs))
         self._state.append(self._extract_state(obs))
@@ -229,6 +241,12 @@ class CollectDemos(Policy):
             )
             return
         ds = h5_file[key]
+        if ds.shape[1:] != values.shape[1:]:
+            raise ValueError(
+                f"HDF5 dataset shape mismatch for '{key}': existing trailing shape "
+                f"{ds.shape[1:]}, new trailing shape {values.shape[1:]}. "
+                "Use a new dataset name or delete the existing .h5 file."
+            )
         old = ds.shape[0]
         ds.resize(old + values.shape[0], axis=0)
         ds[old:] = values
@@ -242,6 +260,8 @@ class CollectDemos(Policy):
         self._terminated[-1] = True
 
         pixels = np.asarray(self._pixels, dtype=np.uint8)
+        pixels_left = np.asarray(self._pixels_left, dtype=np.uint8)
+        pixels_right = np.asarray(self._pixels_right, dtype=np.uint8)
         actions = np.asarray(self._actions, dtype=np.float32)
         proprio = np.asarray(self._proprio, dtype=np.float32)
         state = np.asarray(self._state, dtype=np.float32)
@@ -262,6 +282,8 @@ class CollectDemos(Policy):
             step_idx = np.arange(episode_len, dtype=np.int64)
 
             self._append_dataset(h5_file, "pixels", pixels)
+            self._append_dataset(h5_file, "pixels_left", pixels_left)
+            self._append_dataset(h5_file, "pixels_right", pixels_right)
             self._append_dataset(h5_file, "action", actions)
             self._append_dataset(h5_file, "proprio", proprio)
             self._append_dataset(h5_file, "state", state)
