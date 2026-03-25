@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>aic_lewm_policies</name>
+  <version>0.0.1</version>
+  <description>Policy package for collecting LeWM/stable-worldmodel-compatible demonstrations.</description>
+  <maintainer email="opensource@intrinsic.ai">AIC Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>aic_control_interfaces</depend>
+  <depend>aic_model</depend>
+  <depend>aic_model_interfaces</depend>
+  <depend>aic_task_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>trajectory_msgs</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-h5py</exec_depend>
+  <!-- Used by CollectDemos for image resize when AIC_CAPTURE_PIXEL_MAX > 0 -->
+  <exec_depend>python3-opencv</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
