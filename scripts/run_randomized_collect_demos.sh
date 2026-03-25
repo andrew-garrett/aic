@@ -9,6 +9,8 @@ set -euo pipefail
 #
 # Example:
 #   ./scripts/run_randomized_collect_demos.sh --num-trials 40 --dataset-name aic_cable_r512 --seed 7
+#   AIC_GCS_UPLOAD_URI=gs://my-bucket/aic/ ./scripts/run_randomized_collect_demos.sh --dataset-name foo
+#   ./scripts/run_randomized_collect_demos.sh --gcs-upload gs://my-bucket/aic/full_name.h5
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AIC_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -23,6 +25,9 @@ POLICY_DELAY_SEC=10
 GROUND_TRUTH="true"
 BATCH_SIZE=5
 LOG_ROOT=""
+# CollectDemos writes "${STABLEWM_HOME}/${AIC_DATASET_NAME}.h5" (default ~/.stable-wm).
+STABLEWM_HOME="${STABLEWM_HOME:-${HOME}/.stable-wm}"
+GCS_UPLOAD_URI="${AIC_GCS_UPLOAD_URI:-}"
 
 usage() {
   cat <<EOF
@@ -38,8 +43,14 @@ Options:
   --ground-truth BOOL     true/false for sim ground truth TF (default: ${GROUND_TRUTH})
   --batch-size N          Split trials into YAML batches of N (default: ${BATCH_SIZE})
   --log-root DIR          Parent dir for per-session logs (default: /tmp/aic_collect_logs_<timestamp>)
+  --gcs-upload URI        After run, gsutil cp the dataset .h5 to GCS. URI may be gs://bucket/prefix/
+                          (uploads as prefix/<dataset>_<run_stamp>.h5) or gs://bucket/path/file.h5
   --no-attach             Do not tmux attach (wait for each sim to exit; cleans up session)
   -h, --help              Show this help
+
+Environment:
+  STABLEWM_HOME           HDF5 directory (default: ${HOME}/.stable-wm), must match CollectDemos
+  AIC_GCS_UPLOAD_URI      Same as --gcs-upload if the flag is not passed
 EOF
 }
 
@@ -55,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --ground-truth) GROUND_TRUTH="$2"; shift 2 ;;
     --batch-size) BATCH_SIZE="$2"; shift 2 ;;
     --log-root) LOG_ROOT="$2"; shift 2 ;;
+    --gcs-upload) GCS_UPLOAD_URI="$2"; shift 2 ;;
     --no-attach) ATTACH_LAST=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1"; usage; exit 1 ;;
@@ -113,6 +125,7 @@ fi
 TOTAL_BATCHES="${#BATCH_FILES[@]}"
 
 POLICY_CMD="cd '${AIC_ROOT}' && \
+export STABLEWM_HOME='${STABLEWM_HOME}' && \
 export AIC_DATASET_NAME='${DATASET_NAME}' && \
 export AIC_CAPTURE_PIXEL_MAX='512' && \
 sleep '${POLICY_DELAY_SEC}' && \
@@ -234,3 +247,22 @@ echo "Run complete."
 echo "  Full trial list: ${RANDOM_CFG}"
 echo "  Batch configs:   ${BATCH_DIR}/"
 echo "  Logs:            ${LOG_ROOT}/"
+echo "  Dataset (local): ${STABLEWM_HOME}/${DATASET_NAME}.h5"
+
+if [[ -n "${GCS_UPLOAD_URI}" ]]; then
+  H5_LOCAL="${STABLEWM_HOME}/${DATASET_NAME}.h5"
+  if ! command -v gsutil >/dev/null 2>&1; then
+    echo "  GCS upload skipped: gsutil not found (install Google Cloud SDK)."
+  elif [[ ! -f "${H5_LOCAL}" ]]; then
+    echo "  GCS upload skipped: file missing: ${H5_LOCAL}"
+  else
+    if [[ "${GCS_UPLOAD_URI}" == *.h5 ]]; then
+      GCS_DEST="${GCS_UPLOAD_URI}"
+    else
+      GCS_DEST="${GCS_UPLOAD_URI%/}/${DATASET_NAME}_${RUN_STAMP}.h5"
+    fi
+    echo "  Uploading to GCS: ${GCS_DEST}"
+    gsutil cp "${H5_LOCAL}" "${GCS_DEST}"
+    echo "  Upload complete."
+  fi
+fi
